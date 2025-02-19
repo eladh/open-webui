@@ -7,6 +7,13 @@ from moto import mock_aws
 from open_webui.storage import provider
 from gcp_storage_emulator.server import create_server
 from google.cloud import storage
+import docker
+import time
+import requests
+import importlib
+from open_webui import config
+from azure.storage.blob import BlobServiceClient
+from azure.core.exceptions import ResourceNotFoundError, ResourceExistsError
 
 
 def mock_upload_dir(monkeypatch, tmp_path):
@@ -22,6 +29,8 @@ def test_imports():
     provider.LocalStorageProvider
     provider.S3StorageProvider
     provider.GCSStorageProvider
+    provider.AzureBlobStorageProvider
+
     provider.Storage
 
 
@@ -272,3 +281,154 @@ class TestGCSStorageProvider:
         assert not (upload_dir / self.filename_extra).exists()
         assert self.Storage.bucket.get_blob(self.filename) == None
         assert self.Storage.bucket.get_blob(self.filename_extra) == None
+
+
+class TestAzureBlobStorageProvider:
+
+    file_content = b"test content"
+    filename = "test.txt"
+    filename_extra = "test_exyta.txt"
+    file_bytesio_empty = io.BytesIO()
+    
+    def is_azurite_ready(self, url: str, attempts: int = 15, delay: float = 2) -> bool:
+        """Checks if Azurite is ready by making HTTP requests."""
+        for _ in range(attempts):
+            try:
+                response = requests.get(url)
+                if response.status_code == 200 or response.status_code == 400:
+                    return True
+            except requests.exceptions.RequestException:
+                pass
+            time.sleep(delay)
+        return False
+    
+    @pytest.fixture(scope="class")
+    def storage_provider(self):
+        """Starts Azurite, sets env vars, initializes provider, ensures container stop."""
+        client = docker.from_env()
+        container = None 
+        try:
+            container = client.containers.run(
+                "mcr.microsoft.com/azure-storage/azurite",
+                ports={'10000/tcp': 10000, '10001/tcp': 10001, '10002/tcp': 10002},
+                remove=True,
+                detach=True,
+            )
+
+            azurite_url = "http://127.0.0.1:10000/devstoreaccount1"
+            if not self.is_azurite_ready(azurite_url):
+                raise RuntimeError("Azurite failed to start within the allowed time.")  # Raise to trigger finally
+
+            # Set environment variables (same as before)
+            config.AZURE_STORAGE_ACCOUNT = "http://127.0.0.1:10000/devstoreaccount1"  # Replace with your actual config
+            config.AZURE_STORAGE_ACCESS_KEY = (
+                "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/"
+                "K1SZFPTOtr/KBHBeksoGMGw=="
+            )
+        
+            config.AZURE_CONTAINER_NAME = "test-container"  
+
+            # Reload the provider module to ensure clean initialization with new env vars
+            # This is necessary because the Azure provider's state depends on env vars
+            # that are processed during module import.
+            # While other test providers are changing the internal state of the provider instance as 
+            # part of the test, the Azure provider needs to have its state reset by reloading the module.
+            importlib.reload(provider)        
+            yield provider.AzureBlobStorageProvider()
+
+        except Exception as e:  # Catch any exceptions during setup
+            print(f"Exception during setup: {e}")
+            raise  
+        finally:  # Ensure container stop in all cases
+            if container: 
+                print("Stopping Azurite container")
+                container.stop()
+
+
+    def test_upload_file(self, monkeypatch, tmp_path, storage_provider):  # Inject storage_provider
+        print(f"test_upload_file self id: {id(self)}")
+
+        # Use the injected storage_provider (which is self.Storage) directly:
+        upload_dir = mock_upload_dir(monkeypatch, tmp_path)
+        container_client = storage_provider.container_client  # Use storage_provider here
+        try:
+            container_client.create_container()
+        except ResourceExistsError:
+            pass
+
+        contents, azure_file_path = storage_provider.upload_file(  # Use storage_provider here
+            io.BytesIO(self.file_content), self.filename
+        )
+        blob_client = storage_provider.blob_service_client.get_blob_client(  # Use storage_provider here
+            storage_provider.container_name, self.filename  # Use storage_provider here
+        )
+        downloaded_data = blob_client.download_blob().readall()
+        assert downloaded_data == self.file_content
+        assert (upload_dir / self.filename).exists()
+        assert (upload_dir / self.filename).read_bytes() == self.file_content
+        assert contents == self.file_content
+        assert azure_file_path == "azure://" + storage_provider.container_name + "/" + self.filename  # Use storage_provider here
+
+        with pytest.raises(ValueError):
+            storage_provider.upload_file(self.file_bytesio_empty, self.filename)  # Use storage_provider here
+
+
+    def test_get_file(self, monkeypatch, tmp_path, storage_provider):
+        upload_dir = mock_upload_dir(monkeypatch, tmp_path)
+        container_client = storage_provider.container_client  # Use storage_provider here
+        try:
+            container_client.create_container()
+        except ResourceExistsError:
+            pass
+
+        contents, azure_file_path = storage_provider.upload_file(io.BytesIO(self.file_content), self.filename)
+        file_path = storage_provider.get_file(azure_file_path)
+        assert file_path == str(upload_dir / self.filename)
+        assert (upload_dir / self.filename).exists()
+
+    def test_delete_file(self, monkeypatch, tmp_path, storage_provider):
+        upload_dir = mock_upload_dir(monkeypatch, tmp_path)
+        blob_service_client = storage_provider.blob_service_client
+        container_client = storage_provider.container_client  
+        try:
+            container_client.create_container()
+        except ResourceExistsError:
+            pass
+
+        contents, azure_file_path = storage_provider.upload_file(io.BytesIO(self.file_content), self.filename)
+        assert (upload_dir / self.filename).exists()
+
+        storage_provider.delete_file(azure_file_path)
+        assert not (upload_dir / self.filename).exists()
+
+        blob_client = blob_service_client.get_blob_client(storage_provider.container_name, self.filename)
+        with pytest.raises(ResourceNotFoundError):
+            blob_client.get_blob_properties()
+
+    def test_delete_all_files(self, monkeypatch, tmp_path, storage_provider):
+        upload_dir = mock_upload_dir(monkeypatch, tmp_path)
+        blob_service_client = storage_provider.blob_service_client
+        container_client = storage_provider.container_client  
+        try:
+            container_client.create_container()
+        except ResourceExistsError:
+            pass
+
+        # Upload two files
+        storage_provider.upload_file(io.BytesIO(self.file_content), self.filename)
+        assert (upload_dir / self.filename).exists()
+        storage_provider.upload_file(io.BytesIO(self.file_content), self.filename_extra)
+        assert (upload_dir / self.filename_extra).exists()
+
+        storage_provider.delete_all_files()
+        assert not (upload_dir / self.filename).exists()
+        assert not (upload_dir / self.filename_extra).exists()
+
+        # Verify that blobs are deleted in Azure
+        blob_client1 = blob_service_client.get_blob_client(storage_provider.container_name, self.filename)
+        blob_client2 = blob_service_client.get_blob_client(storage_provider.container_name, self.filename_extra)
+
+        with pytest.raises(ResourceNotFoundError):
+            blob_client1.get_blob_properties()
+        with pytest.raises(ResourceNotFoundError):
+            blob_client2.get_blob_properties()

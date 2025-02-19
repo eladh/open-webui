@@ -684,6 +684,11 @@ GOOGLE_APPLICATION_CREDENTIALS_JSON = os.environ.get(
     "GOOGLE_APPLICATION_CREDENTIALS_JSON", None
 )
 
+AZURE_CONTAINER_NAME = os.environ.get("AZURE_CONTAINER_NAME", None)
+AZURE_STORAGE_ACCOUNT = os.environ.get("AZURE_STORAGE_ACCOUNT", None)
+AZURE_STORAGE_ACCESS_KEY = os.environ.get("AZURE_STORAGE_ACCESS_KEY", None)
+
+
 ####################################
 # File Upload DIR
 ####################################

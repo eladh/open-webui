@@ -17,9 +17,15 @@ from open_webui.config import (
     GOOGLE_APPLICATION_CREDENTIALS_JSON,
     STORAGE_PROVIDER,
     UPLOAD_DIR,
+    AZURE_CONTAINER_NAME,
+    AZURE_STORAGE_ACCOUNT,
+    AZURE_STORAGE_ACCESS_KEY,
 )
 from google.cloud import storage
 from google.cloud.exceptions import GoogleCloudError, NotFound
+from azure.storage.blob import BlobServiceClient, ContentSettings
+from azure.core.exceptions import ResourceNotFoundError, ResourceExistsError
+from azure.identity import DefaultAzureCredential
 from open_webui.constants import ERROR_MESSAGES
 
 
@@ -221,6 +227,89 @@ class GCSStorageProvider(StorageProvider):
         LocalStorageProvider.delete_all_files()
 
 
+class AzureBlobStorageProvider(StorageProvider):
+    def __init__(self):
+        credential = AZURE_STORAGE_ACCESS_KEY or DefaultAzureCredential()
+        self.blob_service_client = BlobServiceClient(
+            account_url=AZURE_STORAGE_ACCOUNT,
+            credential=credential
+        )
+        self.container_name = AZURE_CONTAINER_NAME
+        try:
+            self.container_client = self.blob_service_client.get_container_client(self.container_name)
+            self.container_client.get_container_properties()
+        except ResourceNotFoundError:
+            self.container_client.create_container()
+
+    def upload_file(self, file: BinaryIO, filename: str) -> Tuple[bytes, str]:
+        """Handles uploading of the file to Azure Blob storage."""
+        contents, file_path = LocalStorageProvider.upload_file(file, filename)
+        try:
+            blob_client = self.container_client.get_blob_client(filename)
+            content_settings = ContentSettings(content_type=self._get_content_type(filename))
+            with open(file_path, "rb") as data:
+                blob_client.upload_blob(data, overwrite=True, content_settings=content_settings)
+            return contents, f"azure://{self.container_name}/{filename}"
+        except Exception as e:
+            raise RuntimeError(f"Error uploading file to Azure Blob storage: {e}")
+
+    def get_file(self, file_path: str) -> str:
+        """Handles downloading of the file from Azure Blob storage."""
+        try:
+            filename = file_path.removeprefix("azure://").split("/")[1]
+            local_file_path = f"{UPLOAD_DIR}/{filename}"
+            blob_client = self.container_client.get_blob_client(filename)
+            with open(local_file_path, "wb") as file:
+                blob_data = blob_client.download_blob()
+                file.write(blob_data.readall())
+            return local_file_path
+        except ResourceNotFoundError as e:
+            raise RuntimeError(f"Error downloading file from Azure Blob storage: {e}")
+
+    def delete_file(self, file_path: str) -> None:
+        """Handles deletion of the file from Azure Blob storage."""
+        try:
+            filename = file_path.removeprefix("azure://").split("/")[1]
+            blob_client = self.container_client.get_blob_client(filename)
+            blob_client.delete_blob(delete_snapshots="include")
+        except ResourceNotFoundError as e:
+            raise RuntimeError(f"Error deleting file from Azure Blob storage: {e}")
+
+        # Always delete from local storage
+        LocalStorageProvider.delete_file(file_path)
+
+    def delete_all_files(self) -> None:
+        """Handles deletion of all files from Azure Blob storage."""
+        try:
+            blobs = self.container_client.list_blobs()
+            for blob in blobs:
+                self.container_client.delete_blob(blob.name, delete_snapshots="include")
+        except Exception as e:
+            raise RuntimeError(f"Error deleting all files from Azure Blob storage: {e}")
+
+        # Always delete from local storage
+        LocalStorageProvider.delete_all_files()
+
+    def _get_content_type(self, filename: str) -> str:
+        """Helper method to determine content type based on file extension."""
+        extension = filename.lower().split('.')[-1]
+        content_types = {
+            'txt': 'text/plain',
+            'pdf': 'application/pdf',
+            'png': 'image/png',
+            'jpg': 'image/jpeg',
+            'jpeg': 'image/jpeg',
+            'gif': 'image/gif',
+            'doc': 'application/msword',
+            'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            'xls': 'application/vnd.ms-excel',
+            'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            'ppt': 'application/vnd.ms-powerpoint',
+            'pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+        }
+        return content_types.get(extension, 'application/octet-stream')
+
+
 def get_storage_provider(storage_provider: str):
     if storage_provider == "local":
         Storage = LocalStorageProvider()
@@ -228,6 +317,8 @@ def get_storage_provider(storage_provider: str):
         Storage = S3StorageProvider()
     elif storage_provider == "gcs":
         Storage = GCSStorageProvider()
+    elif storage_provider == "azure_blob":
+        Storage = AzureBlobStorageProvider()
     else:
         raise RuntimeError(f"Unsupported storage provider: {storage_provider}")
     return Storage
